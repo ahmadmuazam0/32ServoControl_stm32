@@ -1,0 +1,11 @@
+{
+    "name": "node-red-project",
+    "description": "A Node-RED Project",
+    "version": "0.0.1",
+    "private": true,
+    "dependencies": {
+        "node-red-contrib-keypress": "~1.0.1",
+        "node-red-dashboard": "~3.6.6",
+        "node-red-node-serialport": "~2.0.3"
+    }
+}
