@@ -1,0 +1,77 @@
+on boot:
+  HAL_Init()
+  SystemClock_Config()
+  init GPIO, DMA, TIM1/TIM3 (PWM for servos), USART1, USART2
+  U1RX_Init(USART1)                    // set up DMA circular + IDLE interrupt
+  U1RX_Start()
+  MF_Init()                            // parser state; MODE=MANUAL, LOOP=0, N=8
+
+  motor_count = clamp(MF_GetMotorCount(), 1..min(MAX_MOTORS,SERVO_NUM))
+  start PWM outputs for all available channels
+  Motion_Init(motor_count)             // set SAFE pose @ default 30 ms/deg
+  s_last_cmd_ms = now()
+
+main loop:
+  handle_meta_updates()                // reacts to N:, G:, MODE:, LOOP:
+    meta = MF_GetMetaUpdates()
+    if meta != 0:
+      s_last_cmd_ms = now()            // meta frames count as activity
+      s_in_failsafe = 0
+
+      if meta has COUNT:
+        motor_count = clamp(MF_GetMotorCount(), 1..min(MAX_MOTORS,SERVO_NUM))
+        init newly-added servos if any, Motion_Init(motor_count)
+
+      if meta has GSPEED:
+        gs = MF_GetGlobalSpeed() (>0)
+        for i in 0..motor_count-1:
+          motion[i].step_delay_ms = gs   // overwrite per-finger speeds
+
+      clear meta flags
+
+  // per-motor updates from A:, V:, A+V:, legacy F#:
+  mask = MF_GetUpdatedMask()
+  if mask != 0:
+    for each i where bit i in mask:
+      st = MF_GetState(i)               // angle [0..180], speed (ms/deg) or 0=ignore
+      motion[i].target = clamp(st.angle)
+      if st.speed > 0:
+        motion[i].step_delay_ms = st.speed
+    remember last A: as "last_cmd_angles"
+    s_step_active = 1
+    s_last_cmd_ms = now()
+    s_in_failsafe = 0
+    send UART2: ETA:<worst_distance * per_channel_ms>   // rough bound
+    (optionally send snapshot "F#:angle,speed;" throttle 20 ms)
+
+  // non-blocking stepping
+  Motion_Update(motor_count):
+    for i:
+      if current != target and now >= next_step_ms:
+        current += sign(target - current) * 1 degree
+        SERVO_MoveTo(i, current)
+        next_step_ms = now + step_delay_ms
+
+  // completion handshake
+  if s_step_active and all channels reached target:
+    send UART2: "DONE"
+    s_last_cmd_ms = now()   // grace time
+    s_step_active = 0
+
+    // AUTO + LOOP: firmware ping-pong demo (SAFE <-> last A:)
+    if MODE==AUTO and LOOP==1 and we have last_cmd_angles:
+      flip flag
+      targets = SAFE_POSE or last_cmd_angles
+      s_step_active = 1
+      s_last_cmd_ms = now()
+      send UART2: ETA:<...>
+
+  // watchdog (AUTO only)
+  if MODE==AUTO and !s_in_failsafe and (now - s_last_cmd_ms) > WATCHDOG_MS:
+    set all targets to SAFE_POSE with default speed
+    s_in_failsafe = 1
+    send UART2: "ERR:WATCHDOG"
+
+UART1 IRQ (IDLE):
+  U1RX_OnUsartIrq() -> drains DMA write index
+  MF_ProcessBytes(bytes)     // framed parser updates per-motor + meta flags

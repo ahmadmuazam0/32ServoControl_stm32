@@ -1,0 +1,406 @@
+///////////////////////////////////////////////////////////////
+// Bluepill STM32F103 — Single-File Filled Pseudocode
+// UART1 (PA9/PA10) protocol with RX DMA CIRCULAR + IDLE IRQ
+// I²C1 (PB6=SCL, PB7=SDA) → PCA9685 @ 0x40 (8-bit HAL addr 0x80)
+// UART2 (PA2/PA3) console logs
+///////////////////////////////////////////////////////////////
+
+
+/////////////////////// CONSTANTS & TYPES ///////////////////////
+CONST MAX_MOTORS              = 16
+CONST DEFAULT_STEP_DELAY_MS   = 20      // ms per degree
+CONST SERVO_MIN_ANGLE         = 0
+CONST SERVO_MAX_ANGLE         = 180
+CONST WATCHDOG_MS             = 800     // RX silence → SAFE pose (AUTO)
+CONST STALL_MS                = 800     // no motion progress → I²C heal
+CONST I2C_WRITES_PER_LOOP     = 6       // per loop PCA writes cap
+CONST PCA_FREQ_HZ             = 50      // servo update frequency
+CONST TX_THROTTLE_MS          = 20      // UART2 snapshot rate limit
+
+// Servo endpoints (µs) used by PCA angle mapper (per 50 Hz / 20 ms period)
+CONST PCA_SERVO_MIN_US        = 1000
+CONST PCA_SERVO_MAX_US        = 2000
+
+// Safe pose for your build (customize as needed)
+ARRAY SAFE_POSE[16] = {0,0,0,0,0,90,0,0, 0,0,0,0,0,0,0,0}
+
+// Motion/command state structures
+TYPE FingerData {
+  angle : u16              // requested angle (0..180)
+  speed_ms_per_deg : u16   // per-motor ms/deg (0 = ignore on input)
+}
+TYPE FingerMotion {
+  current : u16            // planner’s current angle
+  target  : u16            // planner’s target angle
+  step_delay_ms : u16      // ms/deg in use
+  next_step_ms  : u32      // next allowed step time (tick)
+}
+
+
+///////////////////////// GLOBALS ///////////////////////////////
+GLOBAL g_motor_count : u8 = 8
+GLOBAL g_finger[MAX_MOTORS] : FingerData
+GLOBAL g_motion[MAX_MOTORS] : FingerMotion
+GLOBAL g_servo_id[MAX_MOTORS] : u16           // logical → PCA channel
+GLOBAL g_speed_latched[MAX_MOTORS] : u8       // 1 when per-motor V was set
+
+GLOBAL g_last_cmd_angles[MAX_MOTORS] : u16
+GLOBAL g_have_last_cmd : u8 = 0
+GLOBAL g_auto_flip     : u8 = 0
+
+GLOBAL s_last_tx_ms     : u32 = 0
+GLOBAL s_last_cmd_ms    : u32 = 0
+GLOBAL s_move_start_ms  : u32 = 0
+GLOBAL s_step_active    : u8  = 0
+GLOBAL s_in_failsafe    : u8  = 0
+
+// UART1 RX DMA ring bookkeeping (owned by uart_dma module, shown here)
+CONST U1RX_BUF_SIZE = 512
+GLOBAL u1rx_last_idx : size_t = 0    // last consumed index in ring [0..BUF)
+GLOBAL u1rx_ring[U1RX_BUF_SIZE] : u8 // circular RX buffer
+
+
+///////////////////////// UTILITIES /////////////////////////////
+// Return system tick in ms
+FUNCTION now() : u32
+  RETURN HAL_GetTick()
+
+FUNCTION clamp_u16(v:int, lo:int, hi:int) : u16
+  IF v < lo THEN v = lo
+  IF v > hi THEN v = hi
+  RETURN (u16)v
+
+FUNCTION send_line(uart, s:string)
+  HAL_UART_Transmit(uart, s, len(s), timeout=100)
+
+FUNCTION uart2_log(s:string)
+  send_line(UART2, s)
+
+FUNCTION print_snapshot_uart2()
+  // Human-readable mirror: "F#:angle,speed;..."
+  BUF = ""
+  FOR i IN 0..g_motor_count-1:
+    BUF += "F" + (i+1) + ":" + g_motion[i].target + "," + g_motion[i].step_delay_ms + ";"
+  BUF += "\n"
+  send_line(UART2, BUF)
+
+
+//////////////////// PCA9685 (I2C1 PB6/PB7) /////////////////////
+// Low-level write with simple retry (pseudo-HAL)
+FUNCTION I2C_WriteReg16(addr8:u8, reg:u8, bytes:u8[], len:u16) : bool
+  st = HAL_I2C_Mem_Write(I2C1, addr8, reg, reg_len=1, bytes, len, timeout=50)
+  IF st == OK THEN RETURN TRUE
+  // short recover path (soft reset + re-init)
+  PCA_SoftReset()
+  I2C1_Reinit()
+  st = HAL_I2C_Mem_Write(I2C1, addr8, reg, 1, bytes, len, 50)
+  RETURN st == OK
+
+FUNCTION PCA_SoftReset()
+  // I²C General Call, SWRST (0x06) per datasheet
+  HAL_I2C_Master_Transmit(I2C1, 0x00, [0x06], 1, 10)
+  HAL_Delay(1)
+
+FUNCTION PCA9685_Init(freq_hz:u16)
+  // Compute prescale ≈ round(25MHz/(4096*freq) - 1)
+  prescale_f = 25_000_000 / (4096 * freq_hz)
+  prescale   = round(prescale_f) - 1
+  // Sleep, program prescale, wake, OUTDRV, AI, restart
+  MODE1 = READ(I2C1, 0x80, REG=0x00)          // MODE1
+  MODE1_SLEEP = MODE1 OR (1<<4)               // SLEEP bit
+  I2C_WriteReg16(0x80, 0x00, [MODE1_SLEEP], 1)
+  I2C_WriteReg16(0x80, 0xFE, [prescale], 1)   // PRE_SCALE
+  I2C_WriteReg16(0x80, 0x00, [0x00], 1)       // wake
+  I2C_WriteReg16(0x80, 0x01, [0x04], 1)       // MODE2: OUTDRV=1
+  I2C_WriteReg16(0x80, 0x00, [0x20 | 0x80],1) // MODE1: AI=1, RESTART=1
+  HAL_Delay(1)
+
+FUNCTION PCA9685_SetPWM(chan:u8, on:u16, off:u16)
+  base = 0x06 + 4*chan // LED0_ON_L
+  bytes = [ on & 0xFF, on>>8, off & 0xFF, off>>8 ]
+  I2C_WriteReg16(0x80, base, bytes, 4)
+
+FUNCTION PCA9685_SetServoAngle(chan:u8, deg:float)
+  deg = clamp_u16(deg, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE)
+  us = PCA_SERVO_MIN_US + (deg/180.0) * (PCA_SERVO_MAX_US - PCA_SERVO_MIN_US)
+  counts = round(us * 4096 / 20000)          // 20,000 us period @ 50 Hz
+  PCA9685_SetPWM(chan, 0, counts)
+
+FUNCTION I2C1_Reinit()
+  HAL_I2C_DeInit(I2C1)
+  HAL_Delay(2)
+  MX_I2C1_Init()      // PB6/PB7, 100 kHz
+  HAL_Delay(1)
+
+// Free SDA-low: clock SCL (PB6) up to 9 pulses until SDA (PB7) releases
+FUNCTION I2C1_BusClear()
+  HAL_I2C_DeInit(I2C1)
+  PB6/PB7 → GPIO_OD_HIGH
+  HAL_Delay(1)
+  FOR i IN 0..8 WHILE PB7 == LOW:
+    PB6 = LOW ; HAL_Delay(1)
+    PB6 = HIGH; HAL_Delay(1)
+  // STOP: SCL high, SDA high
+  PB6 = HIGH; PB7 = HIGH; HAL_Delay(1)
+  MX_I2C1_Init()
+
+
+/////////////////////// UART1 RX (DMA RING) /////////////////////
+// Called once at boot
+FUNCTION U1RX_Init(uart)
+  // Configure uart+DMA into CIRCULAR mode, install IDLE interrupt, etc.
+  DMA_SetCircular(uart.rx_dma, buffer=u1rx_ring, size=U1RX_BUF_SIZE)
+  Enable_UART_IDE_Interrupt(uart)
+  u1rx_last_idx = 0
+
+FUNCTION U1RX_Start(uart)
+  HAL_UART_Receive_DMA(uart, u1rx_ring, U1RX_BUF_SIZE)
+
+// Called from USART1_IRQHandler when IDLE triggers
+FUNCTION U1RX_OnUsartIrq(uart)
+  // Compute producer index from NDTR (how many left to fill)
+  pos = U1RX_BUF_SIZE - DMA_GetCounter(uart.rx_dma)
+  IF pos == u1rx_last_idx THEN RETURN  // nothing new
+  IF pos > u1rx_last_idx:
+    // contiguous slice
+    motor_frame_feed(&u1rx_ring[u1rx_last_idx], pos - u1rx_last_idx)
+  ELSE:
+    // wrapped: tail then head
+    motor_frame_feed(&u1rx_ring[u1rx_last_idx], U1RX_BUF_SIZE - u1rx_last_idx)
+    motor_frame_feed(&u1rx_ring[0], pos)
+  u1rx_last_idx = pos
+
+
+//////////////////////// PARSER BRIDGE //////////////////////////
+// (Motor-Frame parser API — abstracted; returns updates/meta)
+FUNCTION handle_meta_updates()
+  meta = MF_GetMetaUpdates()
+  IF meta == 0 THEN RETURN
+
+  s_last_cmd_ms = now()      // any meta counts as host activity
+  s_in_failsafe = 0
+
+  IF meta HAS MF_META_COUNT:
+    req = MF_GetMotorCount()
+    new_count = clamp_u16( (req > 0 ? req : g_motor_count), 1, MAX_MOTORS )
+    IF new_count != g_motor_count:
+      g_motor_count = new_count
+      Motion_Init(g_motor_count)
+    send_line(UART1, "DONE:N=" + g_motor_count + "\n")
+
+  IF meta HAS MF_META_GSPEED:
+    gs = MF_GetGlobalSpeed() // >0 guaranteed
+    IF gs > 0:
+      t = now()
+      FOR i IN 0..g_motor_count-1:
+        g_finger[i].speed_ms_per_deg = gs
+        g_motion[i].step_delay_ms    = gs
+        g_motion[i].next_step_ms     = t
+        g_speed_latched[i]           = 1
+    send_line(UART1, "DONE:G=" + gs + "\n")
+
+  IF meta HAS MF_META_MODE:
+    m = (MF_GetMode()==AUTO ? "AUTO" : "MANUAL")
+    send_line(UART1, "DONE:MODE=" + m + "\n")
+
+  IF meta HAS MF_META_LOOP:
+    send_line(UART1, "DONE:LOOP=" + MF_GetLoop() + "\n")
+
+  MF_ClearMetaUpdates(meta)
+
+FUNCTION apply_targets_from_parser()
+  mask = MF_GetUpdatedMask()
+  IF mask == 0 THEN RETURN FALSE   // touched = false
+
+  touched = FALSE
+  FOR i IN 0..g_motor_count-1:
+    IF mask BIT i:
+      m = MF_GetState(i)   // (angle, speed_ms_per_deg)
+      tgt = clamp_u16(m.angle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE)
+      IF tgt != g_motion[i].target: touched = TRUE
+
+      g_finger[i].angle  = tgt
+      g_motion[i].target = tgt
+
+      IF m.speed_ms_per_deg > 0:
+        step = m.speed_ms_per_deg
+        g_finger[i].speed_ms_per_deg = step
+        g_motion[i].step_delay_ms    = step
+        g_speed_latched[i]           = 1
+
+  IF touched:
+    FOR i IN 0..g_motor_count-1:
+      g_last_cmd_angles[i] = g_motion[i].target
+    g_have_last_cmd = 1
+
+  MF_ClearUpdatedMask(mask)
+  RETURN TRUE
+
+
+/////////////////////// MOTION SUBSYSTEM ////////////////////////
+FUNCTION Motion_Init(count:u8)
+  t = now()
+  FOR i IN 0..count-1:
+    g_speed_latched[i]           = 0
+    g_finger[i].angle            = SAFE_POSE[i]
+    g_finger[i].speed_ms_per_deg = DEFAULT_STEP_DELAY_MS
+    g_motion[i].current          = SAFE_POSE[i]
+    g_motion[i].target           = SAFE_POSE[i]
+    g_motion[i].step_delay_ms    = DEFAULT_STEP_DELAY_MS
+    g_motion[i].next_step_ms     = t
+    PCA9685_SetServoAngle(g_servo_id[i], SAFE_POSE[i])
+    g_last_cmd_angles[i]         = SAFE_POSE[i]
+  g_have_last_cmd = 0
+  g_auto_flip = 0
+
+FUNCTION Motion_Update(count:u8)
+  STATIC rr:u8 = 0   // round-robin cursor
+  t = now()
+  quota = I2C_WRITES_PER_LOOP
+  start = rr
+
+  FOR k IN 0..count-1 WHILE quota > 0:
+    i = (start + k) % count
+    IF g_motion[i].current == g_motion[i].target: CONTINUE
+    IF t < g_motion[i].next_step_ms: CONTINUE
+
+    IF HAL_I2C_GetState(I2C1) != READY:
+      g_motion[i].next_step_ms = t + 2
+      BREAK  // give bus a moment
+
+    // one degree toward target
+    IF g_motion[i].current < g_motion[i].target:
+      g_motion[i].current++
+    ELSE:
+      g_motion[i].current--
+
+    PCA9685_SetServoAngle(g_servo_id[i], g_motion[i].current)
+    g_motion[i].next_step_ms = t + g_motion[i].step_delay_ms
+    quota = quota - 1
+
+  rr = (start + 1) % count
+
+FUNCTION all_reached(count:u8) : bool
+  FOR i IN 0..count-1:
+    IF g_motion[i].current != g_motion[i].target: RETURN FALSE
+  RETURN TRUE
+
+
+/////////////////////// WATCHDOGS & HEALING /////////////////////
+FUNCTION progress_watchdog()
+  STATIC last_sum:u32 = 0
+  STATIC last_progress_ms:u32 = 0
+
+  sum = 0
+  FOR i IN 0..g_motor_count-1: sum += g_motion[i].current
+
+  IF s_step_active:
+    IF sum != last_sum:
+      last_sum = sum
+      last_progress_ms = now()
+    ELSE IF now() - last_progress_ms > STALL_MS:
+      // Heal: clear bus, re-init chip, re-sync outputs
+      I2C1_BusClear()
+      PCA9685_Init(PCA_FREQ_HZ)
+      t = now()
+      FOR i IN 0..g_motor_count-1:
+        PCA9685_SetServoAngle(g_servo_id[i], g_motion[i].current)
+        g_motion[i].next_step_ms = t
+      send_line(UART1, "ERR:I2CSTALL\n")
+      uart2_log("I2C recovered & PCA re-synced\n")
+      s_last_cmd_ms = t
+      last_progress_ms = t
+  ELSE:
+    last_sum = sum
+    last_progress_ms = now()
+
+FUNCTION completion_check_and_auto_loop()
+  IF NOT s_step_active: RETURN
+  IF all_reached(g_motor_count):
+    elapsed = now() - s_move_start_ms
+    send_line(UART1, "ELAPSED:" + elapsed + "\n")
+    send_line(UART1, "DONE\n")
+    s_last_cmd_ms = now()
+    s_step_active = 0
+
+    // Simple AUTO ping-pong SAFE ↔ last A:
+    IF MF_GetMode() == AUTO AND g_have_last_cmd:
+      g_auto_flip = g_auto_flip XOR 1
+      FOR i IN 0..g_motor_count-1:
+        g_motion[i].target = (g_auto_flip ? SAFE_POSE[i] : g_last_cmd_angles[i])
+      s_step_active = 1
+      s_last_cmd_ms = now()
+
+FUNCTION rx_watchdog()
+  IF s_in_failsafe: RETURN
+  IF MF_GetMode() != AUTO: RETURN
+  IF now() - s_last_cmd_ms <= WATCHDOG_MS: RETURN
+
+  FOR i IN 0..g_motor_count-1:
+    g_motion[i].target        = SAFE_POSE[i]
+    g_motion[i].step_delay_ms = DEFAULT_STEP_DELAY_MS
+  s_in_failsafe = 1
+  send_line(UART1, "ERR:WATCHDOG\n")
+  s_last_cmd_ms = now()
+
+
+/////////////////////////// BOOT ////////////////////////////////
+FUNCTION main()
+  HAL_Init()
+  SystemClock_Config()
+
+  MX_GPIO_Init()
+  MX_DMA_Init()
+  MX_USART2_UART_Init()      // console
+  MX_USART1_UART_Init()      // protocol (DMA RX CIRCULAR + IDLE)
+  MX_I2C1_Init()             // PB6/PB7 @ 100 kHz
+
+  U1RX_Init(UART1)
+  U1RX_Start(UART1)
+
+  uart2_log("Init PCA9685\n")
+  PCA9685_Init(PCA_FREQ_HZ)
+
+  req = MF_GetMotorCount()
+  g_motor_count = clamp_u16( (req>0 ? req : g_motor_count), 1, MAX_MOTORS )
+  FOR i IN 0..g_motor_count-1: g_servo_id[i] = i
+
+  Motion_Init(g_motor_count)
+
+  uart2_log("Bluepill ready: UART1 DMA+IDLE\n")
+  blink_led(times=6, period_ms=80)
+  s_last_cmd_ms = now()
+  s_in_failsafe = 0
+  uart2_log("System Started\n")
+
+  // Main loop
+  WHILE TRUE:
+    handle_meta_updates()
+
+    IF apply_targets_from_parser() == TRUE:
+      s_step_active = 1
+      s_move_start_ms = now()
+      s_last_cmd_ms = s_move_start_ms
+      s_in_failsafe = 0
+      IF now() - s_last_tx_ms >= TX_THROTTLE_MS:
+        print_snapshot_uart2()
+        toggle_led()
+        s_last_tx_ms = now()
+
+    Motion_Update(g_motor_count)
+    progress_watchdog()
+    completion_check_and_auto_loop()
+    rx_watchdog()
+
+
+/////////////////////// INTERRUPTS //////////////////////////////
+// Must be inside USER CODE blocks so CubeMX won't delete
+ISR USART1_IRQHandler()
+  IF IDLE flag set AND IDLE interrupt enabled:
+    CLEAR IDLE flag
+    CLEAR ORE flag
+    U1RX_OnUsartIrq(UART1)     // feed parser from DMA ring
+  HAL_UART_IRQHandler(UART1)
+
+
+// END — Single-file filled pseudocode
